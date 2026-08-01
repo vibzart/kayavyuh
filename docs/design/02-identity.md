@@ -107,6 +107,7 @@ class VersionOracle(Protocol):
 | --- | --- |
 | Iceberg | snapshot id, or sequence number for the partition |
 | Delta Lake | table version |
+| Lance | native dataset version — first-class, and the format for multimodal corpora |
 | object storage | digest of (size, etag, last-modified), or content hash if cheap |
 | relational table | user-supplied watermark query |
 | unobservable | `None` — see below |
@@ -117,20 +118,35 @@ Dagster has this concept as observable source assets, but as an optional add-on 
 
 ## Non-determinism
 
-**This is the sharpest unsolved problem in the design, and it is getting worse over time.**
+Content-addressing assumes that recomputing an asset from the same inputs yields the same output. Increasingly it does not. An asset that calls an LLM, samples a random seed, reads the wall clock, or hits a third-party API produces a different `DataVersion` on every run, and every downstream provenance hash then changes, cascading unconditional staleness through the graph forever.
 
-Content-addressing assumes that recomputing an asset from the same inputs yields the same output. Increasingly it does not. An asset that calls an LLM, samples a random seed, reads the wall clock, or hits a third-party API produces a different `DataVersion` on every run. Every downstream provenance hash then changes, cascading unconditional staleness through the rest of the graph forever.
+This document originally offered one mechanism for that. Enzyme offers three, and its middle tier reframes the problem well enough that the original single mechanism was demoted to a fallback.
 
-The mitigation is an explicit declaration:
+**The reframing: non-determinism is usually an undeclared input, not a property of the computation.**
+
+Enzyme handles `current_timestamp()` inside a filter predicate by capturing the function's value at the previous and current refresh and computing which rows entered and left the temporal window. The nondeterministic value is treated as an *explicit versioned input* rather than as an opaque source of chaos. Once it is named, everything downstream is deterministic again.
+
+That generalises directly to the case this project cares most about. An LLM call is not inherently unhashable — it is a function of a model identity, a prompt template, a temperature, and a seed. Declare those and the asset becomes deterministic given its declared inputs:
 
 ```python
-@asset(nondeterministic=True)
+@asset(inputs={"model": "some-model@2026-01",
+               "prompt": sha256(TEMPLATE),
+               "temperature": 0.0,
+               "seed": 7})
 def enriched_text(ctx, raw: Table) -> Table: ...
 ```
 
-For such an asset, the recorded `DataVersion` is set to its own `ProvenanceHash` rather than to a digest of its output bytes. The system asserts "this output is *defined* by the inputs and code that produced it, whatever bytes came out." Downstream staleness then propagates on input change, which is the desired behaviour, at the cost of no longer detecting that the output actually changed.
+Now the provenance hash covers them. Re-running with the same declared inputs is legitimately cacheable, and bumping the model version correctly invalidates every downstream asset — which is the behaviour anyone maintaining an embedding pipeline actually wants and which no amount of `nondeterministic=True` provides.
 
-This is a real tradeoff and not obviously the right default. Recorded as an open question in [05-non-goals.md](05-non-goals.md).
+**Three tiers, in order of preference.**
+
+**1. Declare the hidden input.** Model version, prompt hash, seed, a snapshotted clock value. Restores full content-addressing, exact reuse, and correct downstream invalidation. This should be the strongly encouraged default, and the documentation should treat reaching for tier 2 as a smell.
+
+**2. Pin the data version to the provenance hash.** For genuinely stochastic assets — sampling at temperature above zero, an external API with no version to observe. The recorded `DataVersion` becomes the asset's own `ProvenanceHash` rather than a digest of its output bytes, so the system asserts "this output is *defined* by what produced it, whatever bytes came out." Stops the staleness cascade at the cost of no longer detecting that the output changed.
+
+**3. Always recompute.** For assets that must reflect live external state, where a stale-but-consistent answer is worse than an expensive one. Enzyme's equivalent is its fallback to full recomputation, and it exists for the same reason: sometimes there is no honest shortcut.
+
+The remaining open question is narrower than it was, and worth stating precisely: whether tier 2 should exist as a user-facing option at all, or whether every asset that cannot reach tier 1 should be forced to tier 3. Tier 2 trades correctness of change detection for cost, silently. Recorded in [05-non-goals.md](05-non-goals.md).
 
 ## Wide fan-in
 

@@ -13,7 +13,8 @@ Read in order — each depends on the previous one.
 | [design/03-state-and-log.md](design/03-state-and-log.md) | Bitmap partition state, ordinal invariants, paging, the separated audit log |
 | [design/04-compute.md](design/04-compute.md) | Two-tier compute, the planner's edge decision, the tier-independence invariant |
 | [design/05-non-goals.md](design/05-non-goals.md) | Deliberate refusals with reasons, and the open questions |
-| [design/06-prior-art.md](design/06-prior-art.md) | What was borrowed from SQLMesh, Airflow 3, Flyte, Temporal, Iceberg — and what Bauplan already built |
+| [design/06-prior-art.md](design/06-prior-art.md) | What was borrowed from SQLMesh, Airflow 3, Flyte, Temporal, Enzyme, Iceberg — and what Bauplan already built |
+| [design/07-differentiation.md](design/07-differentiation.md) | Where Enzyme structurally cannot reach, what to delegate to it, and what to steal from it |
 | [design/interfaces.py](design/interfaces.py) | Every protocol in one importable, dependency-free file |
 
 ## The commitments
@@ -29,6 +30,14 @@ Stated here so they are easy to find and easy to attack.
 **Engines that can share memory are allowed to, without forking the programming model.** A narrow `Launcher` that every engine implements, plus an optional `ColocatedRuntime` for engines that can host a live multi-step session. Asset code is identical either way.
 
 **Only the control plane touches state.** Workers and user code get a `ControlPlaneClient`, enforced by packaging. Airflow needed a major version and a long migration to establish this boundary after the fact; starting with it is free.
+
+## Where this is and is not better than what exists
+
+Databricks' Enzyme derives row-level change through the Spark query plan and reports compute savings in billions of CPU seconds per day. For relational transformations over Delta tables in Spark it is better than anything this project will do, and the right response is to **delegate that subgraph to Spark Declarative Pipelines** rather than compete for it.
+
+The differentiation is that Enzyme's granularity comes from relational algebra. There is no relational operator for "embed this text," "OCR this page," or "call a model to extract fields," so on AI and multimodal work — where the volume is growing — Enzyme degrades to full recomputation, arriving at partition granularity with none of the partition machinery.
+
+The unit of work here is a partition of *arbitrary* compute. That is a worse unit than a relational operator when one is available, and a much better one when none is. Full argument, including what to steal, in [07-differentiation.md](design/07-differentiation.md).
 
 ## What would falsify this
 

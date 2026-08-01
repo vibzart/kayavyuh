@@ -34,6 +34,10 @@ Dagster+ has a different state backend from Dagster OSS. The scaling limits of t
 
 That is a legitimate business model, but it means complaint 1 is structural rather than a backlog item.
 
+On 13 July 2026 Prefect acquired Dagster Labs. Both products keep their names, licences, and roadmaps, and roughly forty Dagster staff moved across, but one company now monetises two overlapping commercial orchestrators. Whatever incentive existed to make the open-source partition tracker scale is lower than it was, not higher.
+
+The counterweight deserves equal weight: two well-funded companies with good products consolidated instead of both growing. That is evidence the standalone-orchestrator market supports fewer players than it appeared to, and it should temper any conclusion drawn from the paragraph above. Both readings are recorded in [06-prior-art.md](06-prior-art.md).
+
 ## What follows
 
 Three design commitments come out of this.

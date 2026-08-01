@@ -76,8 +76,52 @@ Both provide zero-copy branching — lakeFS over object storage, Nessie over cat
 
 **Not adopted as a dependency.** The environment-pointer design gives the same isolation and atomic-promotion properties without requiring either system, and remains compatible with both for users who already run them.
 
+## Enzyme and Spark Declarative Pipelines — the most important prior art
+
+[Enzyme paper](https://arxiv.org/abs/2603.27775) (SIGMOD 2026, Best Paper Honorable Mention, 18 authors), [Spark Declarative Pipelines](https://docs.databricks.com/aws/en/ldp/), [donation to Apache Spark](https://www.databricks.com/blog/bringing-declarative-pipelines-apache-spark-open-source-project)
+
+Databricks open-sourced its declarative ETL framework — formerly Delta Live Tables — into Apache Spark as Spark Declarative Pipelines. Enzyme is the incremental view maintenance engine underneath it, and it also powers Databricks SQL materialized views. They report cumulative daily compute reduction measured in billions of CPU seconds across thousands of production pipelines.
+
+Read the paper before writing code. The overlap with this design is substantial and the parts that differ are the parts worth understanding.
+
+**How it decides what to recompute.** A cost model estimates total refresh cost as the sum of executor CPU times across joins, aggregates, window functions, shuffles, file scans, and file writes. Estimates are grounded in history: for each operator in a candidate plan, Enzyme finds structurally similar past executions via *normalized physical plan matching* and derives expected CPU time from their observed metrics. Reported accuracy is 87.5% on TPC-DI.
+
+**It plans globally, not per view.** The insight worth stealing outright: an upstream view may be better refreshed incrementally *even when full recomputation would be cheaper for that view*, because incremental refresh produces a smaller change feed and that dramatically reduces cost for everything downstream. Refresh strategy for one node changes the cost of its descendants, so greedy per-node planning is wrong.
+
+**Row lineage through the query plan.** An internal `row_id` column identifies every output tuple at every plan stage. Base tables get stable ids from Delta Lake row tracking; joins derive ids by combining left and right input ids; aggregations use the grouping keys. This is genuine row-level lineage, derived operator by operator — which is precisely the thing declared out of reach for an orchestrator in [05-non-goals.md](05-non-goals.md). They can do it because they own the query planner.
+
+**Non-determinism, handled in three tiers rather than one.** Semantic-preserving rewrites first — an explicit local sort makes `collect_set` deterministic without a cross-node shuffle. Then specialized incrementalization — for temporal filters on `current_timestamp()`, capture the function's value at the previous and current refresh and compute which rows entered and left the window. Only if neither applies does it fall back to full recomputation.
+
+That middle tier is the good idea, and it reframes the problem: they treat the nondeterministic value as an **explicit versioned input** rather than as an opaque property of the query. See [02-identity.md](02-identity.md), where that reframing replaced this design's original single mechanism.
+
+**What it depends on, and this is the whole differentiation story.** Delta Lake change data feed, Delta row tracking, deletion vectors, Delta time travel, Delta transactions for atomic data-plus-provenance commits, and Spark Catalyst. It requires work expressed as trees of relational operators, and it deliberately runs on *normalized* logical plans rather than optimized ones because some Catalyst optimizations destroy the information incrementalization needs.
+
+**Stated constraints.** Some queries cannot be refreshed incrementally at all due to unsupported operators. When more than about 95% of rows change per batch, row-level update costs exceed a full refresh. The cost model is wrong roughly one time in eight.
+
+Full analysis of where this leaves kayavyuh is in [07-differentiation.md](07-differentiation.md). The short version: Enzyme is a refresh optimizer *inside* a relational engine, not a cross-engine scheduler, and the two should compose rather than compete.
+
+## Daft, Lance, and the multimodal engines
+
+[Daft and Ray Data for multimodal](https://mehulbatra.medium.com/a-field-journal-on-ray-data-and-daft-for-multimodal-data-lake-e0c26839f5b5), [Lance format](https://github.com/lance-format/lance), [DuckDB and Polars on Iceberg](https://datalakehousehub.com/blog/2026-05-duckdb-polars-iceberg/)
+
+Daft is an Arrow-native distributed engine built for AI and multimodal work — file fetch, codec, and resample as column operations. Lance is a lakehouse format for multimodal AI with a file format, table format, catalog spec, native data versioning, and vector indexing. DuckDB 1.4 LTS added Iceberg writes and Polars added Iceberg sinks, so both now have complete read-write paths through REST catalogs.
+
+**Daft is adopted as the intended second `ColocatedRuntime`.** This matters more than it sounds: a `Ref` wrapping an Arrow-backed Daft dataframe has far cleaner lifetime semantics than one wrapping a cached Spark DataFrame, whose eviction is not under the caller's control. Open question 1 — whether Tier 2 is a real abstraction or a Ray-only escape hatch — is better answered by Daft than by Spark. See [04-compute.md](04-compute.md).
+
+**Lance is adopted as a `VersionOracle` and `RowLineageSource` target**, since it versions data natively and is the format for exactly the multimodal corpus workloads this project is most useful for.
+
+## Prefect acquiring Dagster Labs
+
+[Announcement](https://www.businesswire.com/news/home/20260713065285/en/Prefect-Acquires-Dagster-Uniting-the-Two-Leading-Modern-Orchestrators), [Dagster's post](https://dagster.io/blog/prefect-is-acquiring-dagster), [analysis](https://thenewstack.io/prefect-acquires-dagster-orchestrator/)
+
+On 13 July 2026 Prefect acquired Dagster Labs. Around forty Dagster staff moved to Prefect; both products keep their names, open-source licences, roadmaps, and pricing; Dagster's founder and CEO became strategic advisers.
+
+Relevant here for one reason. [01-thesis.md](01-thesis.md) argues that Dagster OSS's event-log scaling limits function as the funnel to Dagster+, so there was little incentive to fix them. One company now monetises two overlapping commercial products, which lowers that incentive further rather than raising it.
+
+The counterweight is worth stating with equal force: two well-funded companies with good products consolidated rather than both growing independently. That is evidence the standalone-orchestrator market supports fewer players than it appeared to.
+
 ## Deliberately not pursued
 
-**True incremental view maintenance.** Materialize and Feldera maintain results incrementally through differential dataflow rather than recomputing partitions. It is a fundamentally different execution model, no orchestrator appears to attempt it, and it is a far larger undertaking than everything else here combined. Refused explicitly so the design does not drift toward it by accident.
+**True incremental view maintenance.** See [05-non-goals.md](05-non-goals.md) for the structural argument, which Enzyme sharpened rather than weakened — IVM at this quality requires owning a query planner and a table format's change feed.
 
 **OpenLineage as the internal event format.** Worth emitting, but it is an `AuditLog` implementation rather than an architectural commitment, and the retrofit cost is low. Deferred without prejudice.

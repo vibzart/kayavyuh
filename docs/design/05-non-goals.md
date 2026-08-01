@@ -50,11 +50,17 @@ This is a real limitation and it is chosen. "Send an email," "call an API," and 
 
 ### True incremental view maintenance
 
-Materialize and Feldera maintain results incrementally through differential dataflow rather than recomputing partitions. It is a strictly better answer to "what changed" than partition-level recompute, and it is a fundamentally different execution model.
+Refused, and Enzyme sharpened the reason rather than weakening it.
 
-Refused explicitly rather than by omission, because it is the kind of thing a design drifts toward one feature at a time. No orchestrator appears to attempt it, and it is a larger undertaking than everything else in this design combined.
+Materialize and Feldera maintain results incrementally through differential dataflow. Databricks' Enzyme does it for data engineering specifically, and does it well enough to report compute savings in billions of CPU seconds per day. This is unambiguously a better answer to "what changed" than partition-level recompute, wherever it applies.
 
-Partitions are the granularity. Below that, the answer is [what the table format tracks](#row-level-lineage-computed-by-the-orchestrator).
+**It requires owning a query planner and a table format's change feed.** Enzyme derives an internal `row_id` at every stage of the plan — base tables from Delta row tracking, joins by combining left and right input ids, aggregations from grouping keys — and detects change through Delta change data feed inside Delta transactions. Pull out Catalyst or pull out Delta and the technique stops working.
+
+An orchestrator owns neither. It hands work to an engine and is told the work finished. Building IVM here would mean becoming a query engine, which is refused separately and permanently below.
+
+The consequence is a genuine capability gap and it should be stated rather than spun: for relational transformations over Delta tables in Spark, Enzyme will always beat this project's granularity. The right response is to **delegate that subgraph to Spark Declarative Pipelines** rather than to compete with it, and to be better where relational structure does not exist at all — which is most AI and multimodal work, and where Enzyme itself degrades to full recomputation. Full argument in [07-differentiation.md](07-differentiation.md).
+
+Partitions are the granularity here. Below that, the answer is [what the table format tracks](#row-level-lineage-computed-by-the-orchestrator).
 
 ### A compute or query engine of its own
 
@@ -67,8 +73,13 @@ Unresolved, roughly in order of how much damage a wrong answer does.
 **1. Does the tier-independence invariant survive Spark?**
 Ray's object store and Spark's cached-`DataFrame` model are very different — Spark's cache lifetime is bound to a `SparkSession`, eviction is not under the caller's control, and a `Ref` wrapping a cached DataFrame has weaker guarantees than one wrapping an `ObjectRef`. If `Colocation` cannot be implemented cleanly for Spark, then Tier 2 is a Ray-specific escape hatch wearing the costume of an abstraction, and it should be renamed and rescoped accordingly. This is the single most important thing the prototype has to answer.
 
-**2. Is pinning non-deterministic assets to their provenance hash the right default?**
-The mechanism is described in [02-identity.md](02-identity.md). It stops unconditional staleness cascades but gives up detecting that an output actually changed. LLM-bearing pipelines make this common rather than exotic, so the wrong default here is expensive. It may need to be per-asset with no global default at all.
+**2. Should the provenance-pinning tier exist as a user-facing option at all?**
+Narrower than it was, after adopting Enzyme's three-tier framing in [02-identity.md](02-identity.md). Tier 1 — declare the hidden input, so an LLM asset is keyed on model version, prompt hash, temperature, and seed — is clearly right and should be the encouraged default. Tier 3, always recompute, is clearly honest. The question is tier 2: pinning `DataVersion` to the asset's own `ProvenanceHash` trades away the ability to detect that an output changed, in exchange for cost, and it does so *silently*. That may be an unacceptable thing to offer as a flag. Forcing everything that cannot reach tier 1 down to tier 3 is more expensive and easier to reason about.
+
+**2b. Does the planner need a cost model, and can the audit log supply it?**
+This design currently has none — colocated-versus-persisted edges are chosen on a hand-waved size estimate. Enzyme demonstrates both the need and a method: estimate cost as summed executor CPU across operators, and ground the estimate by matching *normalised plan shape* against structurally similar historical executions. The analogue is matching a normalised step signature — asset, snapshot, partition count, input sizes — against historical run profiles, which the audit log already records and nothing currently reads for planning.
+
+Their harder insight is that planning must be **graph-global**: materialising an upstream asset one way can be worth it even when a different way is cheaper for that asset, because it lowers cost for everything downstream. A greedy per-asset planner gets this wrong by construction. Enzyme's own cost model is right about seven times in eight, which is a useful calibration for how much to trust one.
 
 **3. Snapshot garbage collection.**
 Introduced as a hard requirement by the environment-pointer design in [03-state-and-log.md](03-state-and-log.md), and it did not exist before that. Every deploy that changes a snapshot id leaves physical tables behind, and nothing reclaims them. The hazards are the familiar content-addressed-store ones: never collect a snapshot any environment points at, never collect one an in-flight run is writing to, and keep a retention window long enough that rollback stays possible for more than one deploy. Nix, Bazel, and container registries all have this problem and none solved it trivially. Unsolved here, and it is a correctness issue rather than a housekeeping one — collecting a live snapshot destroys data.

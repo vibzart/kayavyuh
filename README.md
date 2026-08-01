@@ -57,7 +57,8 @@ The reasoning for each refusal is in [`docs/design/05-non-goals.md`](docs/design
 | [03-state-and-log.md](docs/design/03-state-and-log.md) | Bitmap partition state, ordinal allocation, the separated audit log |
 | [04-compute.md](docs/design/04-compute.md) | The two-tier compute model and the tier-independence invariant |
 | [05-non-goals.md](docs/design/05-non-goals.md) | Deliberate refusals, unresolved design questions |
-| [06-prior-art.md](docs/design/06-prior-art.md) | Borrowed from SQLMesh, Airflow 3, Flyte, Temporal, Iceberg; what Bauplan already built |
+| [06-prior-art.md](docs/design/06-prior-art.md) | Borrowed from SQLMesh, Airflow 3, Flyte, Temporal, Enzyme, Iceberg; what Bauplan already built |
+| [07-differentiation.md](docs/design/07-differentiation.md) | Where Enzyme cannot reach, what to delegate to it, what to steal |
 | [interfaces.py](docs/design/interfaces.py) | Every protocol in one importable, dependency-free file |
 
 ## License

@@ -13,6 +13,8 @@ Read alongside:
     04-compute.md         two compute tiers, the control plane boundary
     05-non-goals.md       what is deliberately absent
     06-prior-art.md       what was borrowed, from where, and what was rejected
+    07-differentiation.md where Enzyme structurally cannot reach, and why that
+                          is the only honest basis for building this
 """
 
 from __future__ import annotations
@@ -179,6 +181,32 @@ class Materialization:
     data_version: DataVersion
     provenance: ProvenanceHash
     run_id: RunId
+
+
+class NonDeterminismPolicy(Enum):
+    """How an asset that is not a pure function of its declared inputs is handled.
+
+    Three tiers, taxonomy adopted from Enzyme, in order of preference. The
+    reframing that matters: non-determinism is usually an UNDECLARED INPUT
+    rather than a property of the computation. See 02-identity.md.
+    """
+
+    # Tier 1, strongly preferred. Name the hidden input -- model version, prompt
+    # hash, temperature, seed, a snapshotted clock value -- and the asset becomes
+    # deterministic given its declared inputs. Full content-addressing, exact
+    # reuse, and correct downstream invalidation when the model version bumps.
+    DECLARED_INPUTS = "declared_inputs"
+
+    # Tier 2. DataVersion is set to the asset's own ProvenanceHash rather than to
+    # a digest of its bytes. Stops the staleness cascade for genuinely stochastic
+    # assets, but silently gives up detecting that the output changed. Whether
+    # this should be offered at all is open question 2 in 05-non-goals.md.
+    PIN_TO_PROVENANCE = "pin_to_provenance"
+
+    # Tier 3. For assets that must reflect live external state, where a stale but
+    # self-consistent answer is worse than an expensive one. Enzyme's equivalent
+    # fallback exists for the same reason: sometimes there is no honest shortcut.
+    ALWAYS_RECOMPUTE = "always_recompute"
 
 
 class VersionOracle(Protocol):
@@ -509,6 +537,48 @@ class Decider(Protocol):
     """
 
     def decide(self, world: WorldState) -> Sequence[Action]: ...
+
+
+@dataclass(frozen=True)
+class StepSignature:
+    """Normalised shape of a step, for matching against historical executions.
+
+    The analogue of Enzyme's normalised-physical-plan matching. Deliberately
+    coarse: two steps with the same signature should have had similar cost.
+    """
+
+    asset: AssetKey
+    snapshot: SnapshotId
+    runtime: str
+    partition_count: int
+    input_bytes: int
+
+
+@dataclass(frozen=True)
+class CostEstimate:
+    cpu_seconds: float
+    confidence: float  # Enzyme's own model is right ~7 times in 8. Calibrate.
+
+
+class CostModel(Protocol):
+    """Grounded in history, read from the AuditLog, which already records it.
+
+    Two things this must get right, both from Enzyme:
+
+    Estimates come from OBSERVED executions of structurally similar work, not
+    from a static formula over input sizes.
+
+    Planning is GRAPH-GLOBAL, not greedy per asset. Materialising an upstream
+    asset one way can be worth it even when another way is cheaper for that
+    asset alone, because it lowers cost for everything downstream. A planner
+    that optimises each asset independently gets this wrong by construction.
+
+    Open question 2b in 05-non-goals.md. Nothing implements this yet, and the
+    planner currently picks colocated-vs-persisted edges on a guess.
+    """
+
+    def estimate(self, signature: StepSignature) -> CostEstimate | None: ...
+    def estimate_plan(self, plan: SubPlan) -> CostEstimate | None: ...
 
 
 # ---------------------------------------------------------------------------

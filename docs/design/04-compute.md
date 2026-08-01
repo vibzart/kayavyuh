@@ -109,6 +109,22 @@ The important signature is `execute`, which takes `Ref` and returns `Ref`. Two c
 
 What Ray specifically buys, concretely: zero-copy Arrow handoff through the object store, actor reuse so an expensive setup like a loaded model happens once instead of per partition, GPU scheduling and placement groups, and Ray's own lineage-based task retry underneath the orchestrator's durable cross-run retry.
 
+### Daft is the intended second implementation, not Spark
+
+An interface with one implementation is a fiction, so Tier 2 needs a second one to be credible. Spark was the obvious candidate and it is the wrong one to attempt first.
+
+A `Ref` wrapping a cached Spark `DataFrame` is weak: its lifetime is bound to a `SparkSession`, eviction is not under the caller's control, and the guarantees are materially worse than those of a Ray `ObjectRef`. Building against it first would produce an abstraction shaped by its weakest member — the same failure recorded for the state store in [03-state-and-log.md](03-state-and-log.md).
+
+Daft is Arrow-native and distributed, built for AI and multimodal work, and an Arrow-backed dataframe handle has clean, explicit lifetime semantics. It is a genuinely different engine from Ray while still being able to satisfy `Colocation` honestly.
+
+So open question 1 — is Tier 2 a real abstraction or a Ray-only escape hatch wearing a costume — should be answered with Ray plus Daft. If Spark can be added later, good; if it cannot, that is a fact about Spark's memory model rather than a refutation of the design.
+
+### Delegate relational work rather than competing for it
+
+For the subgraph of assets that are relational transformations over Delta tables in Spark, the right `Launcher` target is Spark Declarative Pipelines, so that Enzyme performs the incrementalisation.
+
+Enzyme derives row-level change through the query plan and reports compute savings measured in billions of CPU seconds per day. This project will not beat that for relational work and should not try. Handing that subgraph over is not a concession — it is the reason a narrow universal `Launcher` exists. See [07-differentiation.md](07-differentiation.md).
+
 ## How the planner decides
 
 For each edge from upstream `U` to downstream `D`, the edge is **colocated** if all of the following hold:
