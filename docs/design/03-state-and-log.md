@@ -27,6 +27,37 @@ So the state store ships with exactly two implementations, and they are chosen b
 
 The audit log is where "point it at your existing stack" is genuinely delivered, and Snowflake works fine there.
 
+## Environments and the physical store
+
+Adopted from SQLMesh. Physical bytes and named access to them are two different things, and separating them is what makes cheap environments possible.
+
+Two mappings, both in the state store:
+
+```
+(asset, snapshot_id)  ->  Location            # the physical store
+environment           ->  {asset -> snapshot_id}   # named pointer sets
+```
+
+`snapshot_id` is the recursive structural hash defined in [02-identity.md](02-identity.md). Nothing reads a physical location directly; everything resolves through an environment.
+
+What this buys, none of which is otherwise cheap:
+
+**Environment creation is instant and nearly free.** A new environment starts as a copy of another environment's pointer set. Assets whose structure has not changed keep pointing at the same physical tables. Only assets that actually diverged get new ones.
+
+**Promotion is atomic.** A backfill under a new snapshot writes into new physical tables while the current environment keeps pointing at the old ones. The environment advances by flipping pointers once, after validation. No partially-backfilled state is ever visible to a reader.
+
+**Rollback is a pointer flip.** Reverting a bad deploy means repointing the environment at the previous snapshot. The old physical tables are still there.
+
+**CI inherits instead of rebuilding.** A pull request materializes only the assets whose snapshot ids changed and reads everything else from the base environment's tables.
+
+This is the Nix model — a content-addressed store plus named profiles — and it is sound here for the reason given in [02-identity.md](02-identity.md): identical snapshot id implies identical logic and identical structural ancestry, so a partition materialized under a snapshot is valid for every environment pointing at it.
+
+Two things it does not give you.
+
+It does not roll back data corruption *within* a snapshot. If bad data lands under an unchanged code version, the fix is a rebackfill of the affected partitions, not a pointer flip. Snapshot-level rollback covers deploys, not data quality.
+
+It does not eliminate garbage. Snapshots that no environment points at still hold physical tables, and they accumulate on every deploy. **This design therefore requires a garbage collector**, with the usual content-addressed-store hazards: never collect a snapshot referenced by any environment, never collect one an in-flight run is writing to, and give users a retention window so rollback stays possible for longer than one deploy. Nix, Bazel, and container registries all have this problem and none of them solved it trivially. Recorded as an open question.
+
 ## Partition state layout
 
 Per asset, four things are stored.

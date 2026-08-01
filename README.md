@@ -30,9 +30,11 @@ Canonical spelling in all identifiers — package, module, org, domain — is `k
 
 A data orchestrator in the same category as Dagster: you declare *assets* (tables, files, models) and their dependencies, and the system decides what needs recomputing and runs it.
 
-Three things are different.
+Four things are different.
 
-**Materialization identity is content-addressed.** An asset partition is identified by a hash of its code version and the data versions of its resolved inputs. Staleness is a hash comparison, not a walk over historical events. See [`docs/design/02-identity.md`](docs/design/02-identity.md).
+**Materialization identity is content-addressed.** Two hashes: a recursive structural `SnapshotId` that decides where bytes live, and a per-partition `ProvenanceHash` that decides whether they are fresh. Staleness is a hash comparison, not a walk over historical events. See [`docs/design/02-identity.md`](docs/design/02-identity.md).
+
+**Environments are pointer sets, not copies.** Physical tables are addressed by snapshot; environments are named pointers into them. Creating a dev environment is instant and copies no data, promotion is an atomic pointer flip so no half-finished backfill is ever visible, and rollback is a pointer flip back. See [`docs/design/03-state-and-log.md`](docs/design/03-state-and-log.md).
 
 **Partition state is a bitmap, not a row per event.** Marking 20,000 partitions as requested is one compare-and-swap write, not 20,000 inserts. The audit trail is a separate, append-only, pluggable log — because "what is currently true" and "what happened" are different questions with different storage requirements. See [`docs/design/03-state-and-log.md`](docs/design/03-state-and-log.md).
 
@@ -55,6 +57,7 @@ The reasoning for each refusal is in [`docs/design/05-non-goals.md`](docs/design
 | [03-state-and-log.md](docs/design/03-state-and-log.md) | Bitmap partition state, ordinal allocation, the separated audit log |
 | [04-compute.md](docs/design/04-compute.md) | The two-tier compute model and the tier-independence invariant |
 | [05-non-goals.md](docs/design/05-non-goals.md) | Deliberate refusals, unresolved design questions |
+| [06-prior-art.md](docs/design/06-prior-art.md) | Borrowed from SQLMesh, Airflow 3, Flyte, Temporal, Iceberg; what Bauplan already built |
 | [interfaces.py](docs/design/interfaces.py) | Every protocol in one importable, dependency-free file |
 
 ## License

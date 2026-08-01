@@ -16,6 +16,56 @@ That is Pipes. Building it would reproduce exactly the limitation this project e
 
 Tier 1 is what makes the project usable. Tier 2 is what makes it differentiated.
 
+## The control plane boundary
+
+Adopted from Airflow 3, whose central architectural change was removing worker access to the metadata database. Workers there now talk to an API server; only the control plane touches the database.
+
+Stated as a rule for this project:
+
+> **User code and workers never touch the state store.**
+> The only surface they may use is a `ControlPlaneClient`.
+
+```python
+class ControlPlaneClient(Protocol):
+    def resolve_input(self, asset: AssetKey,
+                      partition: PartitionKey | None) -> Location | Ref: ...
+    def report_materialization(self, m: Materialization) -> None: ...
+    def emit_event(self, kind: str, payload: Mapping[str, object]) -> None: ...
+    def heartbeat(self, handle: LaunchHandle) -> None: ...
+    def get_config(self, key: str) -> object: ...
+```
+
+Four things follow, and only the first is obvious.
+
+**Workers can be written in any language.** An asset implemented in Rust, Go, or Java needs an HTTP client, not a Postgres driver and a Python ORM.
+
+**The state schema can evolve without redeploying workers.** Bitmap paging, merkle roots, and the environment pointer store are all internal changes behind the client, so none of them becomes a breaking change for people who have written assets.
+
+**Long-running work survives version skew.** A worker started before a control-plane upgrade keeps working against a versioned API rather than breaking on a schema migration mid-run.
+
+**Credentials stop leaking outward.** Asset code never needs database credentials, which matters as soon as anyone runs untrusted or third-party assets.
+
+Enforcement has to be structural rather than documented, because the failure mode is people importing what is reachable. State store types live in a package that user-facing code does not depend on, and the distribution that asset authors install does not contain them at all. Airflow needed a major version and a long migration precisely because that boundary was missing for years and DAG authors had already built on its absence.
+
+## The scheduler is a pure function of state
+
+Not a compute tier, but the same concern: what is allowed to hold state.
+
+Airflow, Dagster, and Prefect each hand-rolled scheduler crash recovery and each has had bugs in it. Temporal's answer is to journal every decision and replay it against deterministic code. The dependency is not worth taking — it would mean running a second stateful system to schedule the first — but the discipline is:
+
+```python
+class Decider(Protocol):
+    def decide(self, world: WorldState) -> Sequence[Action]: ...
+```
+
+`decide` performs no IO, holds no state between calls, and consults no clock it was not handed. Everything it needs arrives in `WorldState`, read from the state store by the caller.
+
+Three payoffs. Crash recovery is recomputation rather than reconstruction. The loop is unit-testable against a literal state fixture, with no database and no cluster. And scheduling decisions become replayable, so "why did it not run yesterday?" is answerable by feeding yesterday's state back in.
+
+This is structurally easier here than in Dagster, for a reason that traces back to the identity design: a pure `decide` needs state to be small and authoritative. Dagster's state is a projection over an event log, so its decision function cannot be pure over a small input. Ours can.
+
+It is also close to unachievable as a retrofit. Once a daemon accumulates caches, in-flight bookkeeping, and incidental clock reads, purity cannot be imposed after the fact.
+
 ## Tier 1
 
 ```python

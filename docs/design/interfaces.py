@@ -8,10 +8,11 @@ Dependency-free by intent: this module must import on a bare interpreter.
 
 Read alongside:
     01-thesis.md          why these boundaries and not others
-    02-identity.md        the provenance/freshness rule
-    03-state-and-log.md   why StateStore is narrow and AuditLog is wide
-    04-compute.md         why compute has two tiers
+    02-identity.md        the two hashes and the freshness rule
+    03-state-and-log.md   bitmap state, environments, the separated audit log
+    04-compute.md         two compute tiers, the control plane boundary
     05-non-goals.md       what is deliberately absent
+    06-prior-art.md       what was borrowed, from where, and what was rejected
 """
 
 from __future__ import annotations
@@ -31,8 +32,23 @@ PartitionKey = NewType("PartitionKey", str)
 Ordinal = NewType("Ordinal", int)
 
 CodeVersion = NewType("CodeVersion", str)
-DataVersion = NewType("DataVersion", str)
+SchemaFingerprint = NewType("SchemaFingerprint", str)
+
+# Two hashes with two jobs. Collapsing them back into one does not work --
+# the argument is in 02-identity.md and it is the most important correction
+# the design has taken.
+#
+#   SnapshotId     structural, recursive over upstream SnapshotIds.
+#                  Answers WHERE bytes live. Changes on deploys.
+#
+#   ProvenanceHash per-partition, incorporates upstream DataVersions.
+#                  Answers WHETHER a partition is fresh. Changes constantly.
+SnapshotId = NewType("SnapshotId", str)
 ProvenanceHash = NewType("ProvenanceHash", str)
+
+DataVersion = NewType("DataVersion", str)
+
+Environment = NewType("Environment", str)  # "prod" | "staging" | "dev-ydatta"
 
 LogicalTime = NewType("LogicalTime", int)
 RunId = NewType("RunId", str)
@@ -129,7 +145,7 @@ class PartitionMapping(Protocol):
         """True when every downstream partition depends on the whole upstream asset.
 
         Lets the planner compare a single merkle root instead of hashing every
-        upstream version. Open question 3 in 05-non-goals.md.
+        upstream version. Open question 5 in 05-non-goals.md.
         """
         ...
 
@@ -143,7 +159,12 @@ class PartitionMapping(Protocol):
 class Materialization:
     """The atomic unit of "this now exists, and here is what defines it".
 
-    provenance == H(code_version, sorted(input_versions.items()))
+        snapshot   == H(code_version, schema_fingerprint, {upstream snapshot ids})
+        provenance == H(snapshot, {(upstream, data_version) for resolved inputs})
+
+    The schema fingerprint is inside the snapshot hash on purpose, borrowed from
+    Flyte's interface hash. Without it an asset whose output schema changes but
+    whose code hash is stable reports fresh while serving the wrong shape.
 
     For an asset declared nondeterministic, data_version is set equal to
     provenance rather than to a digest of the output bytes. See 02-identity.md.
@@ -151,12 +172,13 @@ class Materialization:
 
     asset: AssetKey
     partition: PartitionKey | None
+    snapshot: SnapshotId
     code_version: CodeVersion
+    schema_fingerprint: SchemaFingerprint
     input_versions: Mapping[AssetKey, DataVersion]
     data_version: DataVersion
     provenance: ProvenanceHash
     run_id: RunId
-    location: Location | None = None
 
 
 class VersionOracle(Protocol):
@@ -176,13 +198,28 @@ class VersionOracle(Protocol):
     ) -> DataVersion | None: ...
 
 
+class RowLineageCapability(Enum):
+    """What a backend can actually promise about row lineage.
+
+    Reported rather than inferred, because Iceberg v3 support is uneven across
+    engines and a write path that silently drops _row_id would otherwise mislead
+    anyone building a compliance workflow on it. See 05-non-goals.md.
+    """
+
+    NONE = "none"
+    READ = "read"  # readable, but writes may drop it
+    PRESERVED_ON_UPDATE = "preserved_on_update"
+
+
 class RowLineageSource(Protocol):
     """Surfaces row lineage the storage layer already tracks. Never computes it.
 
     Iceberg v3 exposes _row_id and _last_updated_sequence_number; that
-    implementation returns a reference into them. Everything else returns None,
-    and the UI shows the granularity actually available. See 05-non-goals.md.
+    implementation returns a reference into them. Everything else reports NONE,
+    and the UI shows the granularity actually available.
     """
+
+    def capability(self, location: Location) -> RowLineageCapability: ...
 
     def row_lineage(
         self,
@@ -190,6 +227,41 @@ class RowLineageSource(Protocol):
         partition: PartitionKey | None,
         version: DataVersion,
     ) -> object | None: ...
+
+
+# ---------------------------------------------------------------------------
+# Physical store and environments  (adopted from SQLMesh)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StoredSnapshot:
+    """Physical bytes, addressed by the structure that produced them.
+
+    One per (asset, snapshot). Partitions live inside it; a partition
+    materialising does NOT create a new StoredSnapshot, which is why physical
+    storage is keyed by snapshot rather than by provenance.
+    """
+
+    asset: AssetKey
+    snapshot: SnapshotId
+    location: Location
+    created_at_logical_time: LogicalTime
+
+
+@dataclass(frozen=True)
+class EnvironmentPointer:
+    """Named access to a snapshot. An environment is just a set of these.
+
+    Safe to share physical data across environments by construction: identical
+    snapshot implies identical logic AND identical structural ancestry, so any
+    partition materialised under it is valid for every environment pointing at
+    it. The recursion in SnapshotId is what makes that true.
+    """
+
+    environment: Environment
+    asset: AssetKey
+    snapshot: SnapshotId
 
 
 # ---------------------------------------------------------------------------
@@ -224,11 +296,18 @@ class StatusDelta:
 
 @dataclass(frozen=True)
 class StateTransaction:
-    """Atomic, optimistically concurrent. Succeeds wholly or changes nothing."""
+    """Atomic, optimistically concurrent. Succeeds wholly or changes nothing.
+
+    Pointer moves ride in the same transaction as materializations so that
+    promotion is atomic -- no reader ever observes a partially advanced
+    environment.
+    """
 
     expected: LogicalTime
     materializations: Sequence[Materialization] = ()
     status_deltas: Sequence[StatusDelta] = ()
+    register_snapshots: Sequence[StoredSnapshot] = ()
+    move_pointers: Sequence[EnvironmentPointer] = ()
 
 
 @dataclass(frozen=True)
@@ -246,6 +325,9 @@ class StateStore(Protocol):
     rather than a missing feature -- an interface that also admitted Snowflake
     would be forced down to row-per-event semantics, which is the exact defect
     this project exists to remove. Reasoning in 03-state-and-log.md.
+
+    Nothing outside the control plane may reach this. Workers and user code get
+    a ControlPlaneClient instead; see 04-compute.md.
     """
 
     def asset_state(
@@ -261,12 +343,33 @@ class StateStore(Protocol):
     def merkle_root(self, asset: AssetKey) -> ProvenanceHash | None:
         """Summary over all per-partition versions, for total dependencies.
 
-        None until open question 3 in 05-non-goals.md is resolved.
+        None until open question 5 in 05-non-goals.md is resolved.
         """
         ...
 
-    # Single-writer bookkeeping for the scheduler. Another capability an OLAP
-    # backend cannot provide, and another reason this store is not pluggable.
+    # --- physical store and environments ---
+
+    def resolve(self, env: Environment, asset: AssetKey) -> StoredSnapshot | None: ...
+    def pointers(self, env: Environment) -> Sequence[EnvironmentPointer]: ...
+
+    def fork_environment(self, source: Environment, target: Environment) -> None:
+        """Copy a pointer set. Instant, and copies no data."""
+        ...
+
+    def unreferenced_snapshots(self) -> Sequence[StoredSnapshot]:
+        """Candidates for collection -- pointed at by no environment.
+
+        Necessary but NOT sufficient to delete: an in-flight run may be writing
+        to one, and a retention window has to keep rollback possible for longer
+        than a single deploy. Deleting a live snapshot destroys data, which makes
+        this a correctness problem rather than housekeeping. Open question 3.
+        """
+        ...
+
+    # --- single-writer bookkeeping for the scheduler ---
+    # Another capability an OLAP backend cannot provide, and another reason this
+    # store is not pluggable.
+
     def acquire_lease(self, name: str, holder: str, ttl_s: int) -> Lease | None: ...
     def renew_lease(self, lease: Lease) -> Lease | None: ...
     def release_lease(self, lease: Lease) -> None: ...
@@ -319,6 +422,96 @@ class AuditLog(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# The control plane boundary  (adopted from Airflow 3)
+# ---------------------------------------------------------------------------
+
+
+class ControlPlaneClient(Protocol):
+    """The ONLY surface user code and workers may touch.
+
+    Airflow 3's central architectural change was removing worker access to the
+    metadata database, and it cost them a major version plus a long migration
+    because DAG authors had built on its absence for years. Starting with the
+    boundary is free; adding it later is not.
+
+    What it buys beyond isolation:
+      * workers in any language -- an HTTP client, not a Postgres driver
+      * the state schema can evolve (paging, merkle roots, pointer store)
+        without any of it being a breaking change for asset authors
+      * long-running work survives control plane upgrades via a versioned API
+      * asset code never holds database credentials, which matters the moment
+        anyone runs third-party assets
+
+    Enforcement is structural, not documentary: state store types live in a
+    package the user-facing distribution does not depend on.
+    """
+
+    def resolve_input(
+        self, asset: AssetKey, partition: PartitionKey | None
+    ) -> Location | Ref: ...
+
+    def report_materialization(self, m: Materialization) -> None: ...
+    def emit_event(self, kind: str, payload: Mapping[str, object]) -> None: ...
+    def heartbeat(self, handle: LaunchHandle) -> None: ...
+    def get_config(self, key: str) -> object: ...
+
+
+# ---------------------------------------------------------------------------
+# Scheduling -- a pure function of state  (lesson from Temporal, not Temporal)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorldState:
+    """Everything decide() is allowed to see.
+
+    Read from the store by the caller. Note now_epoch_s is handed in rather than
+    read from a clock, because a decider that reads the clock is not replayable.
+    """
+
+    logical_time: LogicalTime
+    now_epoch_s: int
+    environment: Environment
+    assets: Mapping[AssetKey, AssetState]
+    in_flight: Mapping[RunId, Sequence["Step"]]
+
+
+class ActionKind(Enum):
+    REQUEST = "request"  # materialise these partitions
+    CANCEL = "cancel"
+    PROMOTE = "promote"  # advance environment pointers
+    COLLECT = "collect"  # release an unreferenced snapshot
+
+
+@dataclass(frozen=True)
+class Action:
+    kind: ActionKind
+    asset: AssetKey | None = None
+    ordinals: OrdinalSet | None = None
+    snapshot: SnapshotId | None = None
+    run_id: RunId | None = None
+
+
+class Decider(Protocol):
+    """decide() does no IO, holds no state between calls, and reads no clock.
+
+    Payoffs: crash recovery is recomputation rather than reconstruction; the
+    loop is unit-testable against a literal fixture with no database and no
+    cluster; and "why did it not run yesterday?" is answered by replaying
+    yesterday's state.
+
+    Structurally easier here than in Dagster, and for a reason that traces back
+    to the identity design -- a pure decide() needs state to be small and
+    authoritative, and Dagster's state is a projection over an event log.
+
+    Close to unachievable as a retrofit, once a daemon has accumulated caches
+    and incidental clock reads.
+    """
+
+    def decide(self, world: WorldState) -> Sequence[Action]: ...
+
+
+# ---------------------------------------------------------------------------
 # Compute tier 1 -- Launcher. Universal, narrow, required.
 # ---------------------------------------------------------------------------
 
@@ -327,6 +520,7 @@ class AuditLog(Protocol):
 class Step:
     asset: AssetKey
     partition: PartitionKey | None
+    snapshot: SnapshotId
     code_version: CodeVersion
     config: Mapping[str, object] = field(default_factory=dict)
 
@@ -336,6 +530,7 @@ class WorkUnit:
     """Steps whose inputs and outputs are all resolved to storage locations."""
 
     run_id: RunId
+    environment: Environment
     steps: Sequence[Step]
     inputs: Mapping[AssetKey, Location]
     outputs: Mapping[AssetKey, Location]
@@ -415,6 +610,7 @@ class SubPlan:
     """A connected slice of the run that one colocation session will host."""
 
     run_id: RunId
+    environment: Environment
     steps: Sequence[Step]
     colocated_edges: Sequence[tuple[AssetKey, AssetKey]]
     persisted_inputs: Mapping[AssetKey, Location]
@@ -427,6 +623,10 @@ class Colocation(Protocol):
     The signature that matters is execute(): Ref in, Ref out. Two consecutive
     steps in the same colocation never touch storage. That is the capability
     a subprocess protocol structurally cannot provide.
+
+    Prior art, and it has a paper: Bauplan (arXiv 2410.17465) measures Arrow
+    handoff between pipeline steps as orders of magnitude faster than
+    write-to-object-storage-then-read. This is no longer a novel claim.
     """
 
     def load(self, asset: AssetKey, location: Location) -> Ref: ...
@@ -462,27 +662,41 @@ class ColocatedRuntime(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# The invariant
+# Invariants
 # ---------------------------------------------------------------------------
 
-# An asset definition is written once and is byte-identical under both tiers.
-# The tier decides only whether an edge is a Ref or a Location. If any asset
-# body needs to know which tier it is running under, the abstraction has failed
-# and the design is wrong.
+# 1. TIER INDEPENDENCE
+#    An asset definition is written once and is byte-identical under both tiers.
+#    The tier decides only whether an edge is a Ref or a Location. If any asset
+#    body needs to know which tier it is running under, the abstraction has
+#    failed and the design is wrong.
 #
-# Asset bodies therefore receive and return values, never paths:
+#    Asset bodies therefore receive and return values, never paths:
 #
-#     @asset(partitions=daily("2024-01-01"))
-#     def orders(ctx, raw_orders: Table) -> Table:
-#         return raw_orders.filter(...)
+#        @asset(partitions=daily("2024-01-01"))
+#        def orders(ctx, raw_orders: Table) -> Table:
+#            return raw_orders.filter(...)
 #
-# Dagster's IO managers already get this far. The difference is that in Dagster
-# materialising at every edge is a fixed property of the framework; here,
-# whether an edge hits storage is a planner decision.
+#    Dagster's IO managers already get this far. The difference is that in
+#    Dagster materialising at every edge is a fixed property of the framework;
+#    here, whether an edge hits storage is a planner decision.
+#
+# 2. CONTROL PLANE ISOLATION
+#    Nothing outside the control plane imports StateStore. Workers and user code
+#    use ControlPlaneClient. Enforced by packaging, not by convention.
+#
+# 3. SHARING SAFETY
+#    Identical SnapshotId implies identical logic and identical structural
+#    ancestry, so a partition materialised under a snapshot is valid for every
+#    environment pointing at it. This is what makes zero-copy environments sound
+#    rather than merely convenient, and it depends on SnapshotId being recursive.
+#
+# 4. DECIDER PURITY
+#    decide(WorldState) -> [Action] performs no IO and reads no clock.
 #
 # FALSIFIABLE TEST, and the first thing the prototype must try to break:
 # run one unmodified asset module under the subprocess Launcher, then under the
 # Ray ColocatedRuntime. Same source, same results, differing only in wall-clock
 # time and in how many objects were written to storage. If passing that test
-# needs a single `if` inside an asset body, this model does not work and has to
-# be redesigned before anything is built on it.
+# needs a single `if` inside an asset body, invariant 1 does not hold and the
+# model has to be redesigned before anything is built on it.
